@@ -38,6 +38,8 @@
 
 #include "DeferredInitializer.h"
 #include "EntitySystem.h"
+#include "GameValueStub.h"
+#include <CrashFixes.FakeParachuteProp.h>
 
 using namespace winrt::Windows::Gaming::Input;
 
@@ -242,7 +244,7 @@ static void writeVehicleMemory(fx::ScriptContext& context, std::string_view nn)
 }
 
 static float* PassengerMassPtr;
-static float* SnowGripFactor;
+static GameValueStub<float> SnowGripFactor;
 
 static int StreamRenderGfxPtrOffset;
 static int HandlingDataPtrOffset;
@@ -287,6 +289,7 @@ static int VisualHeightSetOffset = 0x07C;
 static int LightMultiplierGetOffset;
 static int VehiclePitchBiasOffset;
 static int VehicleRollBiasOffset;
+static int VehicleFlagsOffset;
 
 static int VehicleDamageParentOffset;
 static int VehicleHandlingOffset;
@@ -772,14 +775,22 @@ static HookFunction initFunction([]()
 	}
 
 	{
+		auto location = hook::get_pattern<char>("48 85 C0 74 3C 8B 80 ? ? ? ? C1 E8 0F");
+		VehicleFlagsOffset = *(uint32_t*)(location + 7);
+	}
+
+	{
 		auto location = hook::get_pattern<char>("F3 0F 59 3D ? ? ? ? F3 0F 58 3D ? ? ? ? 48 85 C9", 4);
 		PassengerMassPtr = hook::get_address<float*>(location);
 	}
 
 	{
-		SnowGripFactor = (float*)hook::AllocateStubMemory(4);
-		static uint8_t* location = hook::get_pattern<uint8_t>("F3 0F 5C C8 48 3B C8", 4);
-		hook::put<int32_t>(location, (intptr_t)SnowGripFactor - (intptr_t)location - 4);
+		auto location = hook::get_pattern<uint32_t>("F3 0F 59 05 ? ? ? ? 48 23 C8", 4);
+		SnowGripFactor.Init(*hook::get_address<float*>(location));
+		SnowGripFactor.SetLocation(location);
+
+		location = hook::get_pattern<uint32_t>("F3 0F 59 05 ? ? ? ? 8B 42", 4);
+		SnowGripFactor.SetLocation(location);
 	}
 
 	{
@@ -1402,6 +1413,43 @@ static HookFunction initFunction([]()
 		}
 	});
 
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_HAS_FLAG", [](fx::ScriptContext& context)
+	{
+		int flagIndex = context.GetArgument<int>(1);
+
+		if (flagIndex < 0 || flagIndex >= 256)
+		{
+			return;
+		}
+
+		if (fwEntity* vehicle = getAndCheckVehicle(context, "GET_VEHICLE_HAS_FLAG"))
+		{
+			auto addr = readValue<uint64_t>(vehicle, ModelInfoPtrOffset);
+			auto flagBlocks = reinterpret_cast<std::bitset<256>*>(addr + VehicleFlagsOffset);
+			
+			context.SetResult<bool>(flagBlocks->test(flagIndex));
+		}
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_VEHICLE_FLAG", [](fx::ScriptContext& context)
+	{
+		int flagIndex = context.GetArgument<int>(1);
+		bool value = context.GetArgument<bool>(2);
+		
+		if (flagIndex < 0 || flagIndex >= 256)
+		{
+			return;
+		}
+
+		if (fwEntity* vehicle = getAndCheckVehicle(context, "SET_VEHICLE_FLAG"))
+		{
+			auto addr = readValue<uint64_t>(vehicle, ModelInfoPtrOffset);
+			auto flagBlocks = reinterpret_cast<std::bitset<256>*>(addr + VehicleFlagsOffset);
+
+			flagBlocks->set(flagIndex, value);
+		}
+	});
+
 	fx::ScriptEngine::RegisterNativeHandler("IS_VEHICLE_WANTED", std::bind(readVehicleMemoryBit<&IsWantedOffset, 3>, _1, "IS_VEHICLE_WANTED"));
 
 	fx::ScriptEngine::RegisterNativeHandler("IS_VEHICLE_PREVIOUSLY_OWNED_BY_PLAYER", std::bind(readVehicleMemoryBit<&PreviouslyOwnedByPlayerOffset, 1>, _1, "IS_VEHICLE_PREVIOUSLY_OWNED_BY_PLAYER"));
@@ -1590,18 +1638,13 @@ static HookFunction initFunction([]()
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_VEHICLE_XMAS_SNOW_FACTOR", [](fx::ScriptContext& context)
 	{
-		float gripFactor = context.GetArgument<float>(0);
-
-		if (gripFactor < 0.0)
-		{
-			gripFactor = 0.0;
-		}
-		*SnowGripFactor = gripFactor;
+		const auto gripFactor = context.GetArgument<float>(0);
+		SnowGripFactor.Set(std::isnan(gripFactor) ? 0.0f : std::clamp(gripFactor, 0.0f, 2.0f));
 	});
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_XMAS_SNOW_FACTOR", [](fx::ScriptContext& context)
 	{
-		context.SetResult<float>(*SnowGripFactor);
+		context.SetResult<float>(SnowGripFactor.Get());
 	});
 
 	static struct : jitasm::Frontend
@@ -1683,7 +1726,7 @@ static HookFunction initFunction([]()
 		g_globalFuelConsumptionMultiplier = 1.f;
 
 		*PassengerMassPtr = 0.05f;
-		*SnowGripFactor = 0.2f;
+		SnowGripFactor.Reset();
 	});
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_VEHICLE_AUTO_REPAIR_DISABLED", [](fx::ScriptContext& context)
@@ -1931,6 +1974,18 @@ static HookFunction initFunction([]()
 		{
 			context.SetResult<bool>(DoesVehicleUseFuel(vehicle));
 		}
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("ADD_AUTHORIZED_PARACHUTE_MODEL", [](fx::ScriptContext& context)
+	{
+		uint32_t modelHash = context.GetArgument<uint32_t>(0);
+		AddAuthorizedParachuteModel(modelHash);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("ADD_AUTHORIZED_PARACHUTE_PACK_MODEL", [](fx::ScriptContext& context)
+	{
+	uint32_t modelHash = context.GetArgument<uint32_t>(0);
+		AddAuthorizedParachutePackModel(modelHash);
 	});
 
 	MH_Initialize();

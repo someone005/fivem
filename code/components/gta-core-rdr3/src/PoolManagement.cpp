@@ -146,6 +146,7 @@ static const char* poolEntriesTable[] = {
 	"CDecalExtensionComponent",
 	"CDefaultCrimeInfo",
 	"CDogItem",
+	"CDoorExtension",
 	"CDynamicEntityAnimationComponent",
 	"CEmotionalLocoHelper",
 	"CEntityGameInfoComponent",
@@ -207,8 +208,10 @@ static const char* poolEntriesTable[] = {
 	"CNetObjAnimScene",
 	"CNetObjCombatDirector",
 	"CNetObjDoor",
+	"CNetObjDraftVehicle",
 	"CNetObjGroupScenario",
 	"CNetObjGuardZone",
+	"CNetObjHorse"
 	"CNetObjHerd",
 	"CNetObjIncident",
 	"CNetObjObject",

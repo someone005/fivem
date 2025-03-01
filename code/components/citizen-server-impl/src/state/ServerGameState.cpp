@@ -2636,6 +2636,11 @@ void ServerGameState::ReassignEntityInner(uint32_t entityHandle, const fx::Clien
 /// <param name="callOnInitialEntity">Whether the function should do the `fn` call on the initialTrain</param>
 void ServerGameState::IterateTrainLink(const sync::SyncEntityPtr& initialTrain, std::function<bool(sync::SyncEntityPtr&)> fn, bool callOnInitialEntity)
 {
+	static constexpr uint16_t kMaxDuplicateEntityIds = 3;
+
+	static thread_local std::unordered_set<uint32_t> processedTrains{};
+	processedTrains.clear();
+
 	// for most stuff we want to call on the intial entity
 	if (callOnInitialEntity)
 	{
@@ -2645,21 +2650,25 @@ void ServerGameState::IterateTrainLink(const sync::SyncEntityPtr& initialTrain, 
 		}
 	}
 
-	if (auto trainState = initialTrain->syncTree->GetTrainState())
+	if (const auto trainState = initialTrain->syncTree->GetTrainState())
 	{
-		auto recurseTrain = [=](const fx::sync::SyncEntityPtr& train)
+		uint16_t duplicateEntityIds = 0;
+		auto recurseTrain = [this, &duplicateEntityIds, &fn](const fx::sync::SyncEntityPtr& train)
 		{
 			for (auto link = GetNextTrain(this, train); link; link = GetNextTrain(this, link))
 			{
-				// this is expected to make sure that the initial train & the link trains are not called twice
-				// since this could lead to double locking the client mutex in ReassignEntity
-				// we also ignore the train sent via the call to `recurseTrain` as we should've called `fn` before here
-				if (link->handle == initialTrain->handle)
+				// train links back to another train that has already been processed, this shouldn't happen.
+				if (!processedTrains.insert(link->handle).second)
 				{
+					// our linked trains are looped at least 3 times together
+					if (++duplicateEntityIds > kMaxDuplicateEntityIds)
+					{
+						return;
+					}
+
 					continue;
 				}
 
-				// if the function returns true then we should stop iterating
 				if (!fn(link))
 				{
 					return;
@@ -2670,8 +2679,10 @@ void ServerGameState::IterateTrainLink(const sync::SyncEntityPtr& initialTrain, 
 		if (trainState->isEngine)
 		{
 			recurseTrain(initialTrain);
+			return;
 		}
-		else if (trainState->engineCarriage && trainState->engineCarriage != initialTrain->handle)
+
+		if (trainState->engineCarriage && static_cast<uint32_t>(trainState->engineCarriage) != initialTrain->handle)
 		{
 			if (auto engine = GetTrain(this, trainState->engineCarriage))
 			{
@@ -2679,6 +2690,8 @@ void ServerGameState::IterateTrainLink(const sync::SyncEntityPtr& initialTrain, 
 				{
 					return;
 				}
+
+				processedTrains.insert(engine->handle);
 				recurseTrain(engine);
 			}
 		}
@@ -4527,6 +4540,7 @@ void ServerGameState::AttachToObject(fx::ServerInstanceBase* instance)
 	m_instance = instance;
 
 	m_lockdownModeVar = instance->AddVariable<fx::EntityLockdownMode>("sv_entityLockdown", ConVar_None, m_entityLockdownMode, &m_entityLockdownMode);
+	m_stateBagStrictModeVar = instance->AddVariable<bool>("sv_stateBagStrictMode", ConVar_None, m_stateBagStrictMode, &m_stateBagStrictMode);
 
 	auto sbac = fx::StateBagComponent::Create(fx::StateBagRole::Server);
 	sbac->SetGameInterface(this);
@@ -5993,6 +6007,44 @@ struct CStopNetworkSyncedSceneEvent
 
 	MSGPACK_DEFINE_MAP(sceneId);
 };
+
+/*NETEV givePedScriptedTaskEvent SERVER
+/#*
+ * Triggered when a client requests to assign a scripted task to a remotely-controlled ped.
+ *
+ * @param sender - The network ID of the player initiating the event.
+ * @param data - The event data.
+ #/
+declare function givePedScriptedTaskEvent(sender: number, data: {
+	/#*
+	 * The network ID of the target ped receiving the task.
+	 #/
+	entityNetId: number,
+	/#*
+	 * The ID of the assigned task. See [GetIsTaskActive](https://docs.fivem.net/natives/?_0xB0760331C7AA4155)
+	 #/
+	taskId: number,
+	
+}): void;
+*/
+struct CGivePedScriptedTaskEvent
+{
+	uint16_t entityNetId;
+	uint16_t taskId;
+
+	void Parse(rl::MessageBufferView& buffer)
+	{
+		entityNetId = buffer.Read<uint16_t>(16);
+		taskId = buffer.Read<uint16_t>(10);
+	}
+
+	inline std::string GetName()
+	{
+		return "givePedScriptedTaskEvent";
+	}
+
+	MSGPACK_DEFINE_MAP(entityNetId, taskId);
+};
 #endif
 
 #ifdef STATE_RDR3
@@ -7443,6 +7495,7 @@ std::function<bool()> fx::ServerGameState::GetGameEventHandler(const fx::ClientS
 		case NETWORK_START_SYNCED_SCENE_EVENT: return GetHandler<CStartNetworkSyncedSceneEvent>(instance, client, std::move(buffer));
 		case NETWORK_UPDATE_SYNCED_SCENE_EVENT: return GetHandler<CUpdateNetworkSyncedSceneEvent>(instance, client, std::move(buffer));
 		case NETWORK_STOP_SYNCED_SCENE_EVENT: return GetHandler<CStopNetworkSyncedSceneEvent>(instance, client, std::move(buffer));
+		case GIVE_PED_SCRIPTED_TASK_EVENT: return GetHandler<CGivePedScriptedTaskEvent>(instance, client, std::move(buffer));
 		default:
 			break;
 	};
@@ -7570,6 +7623,7 @@ std::function<bool()> fx::ServerGameState::GetGameEventHandlerWithEvent(const fx
 		case net::force_consteval<uint32_t, HashRageString("NETWORK_START_SYNCED_SCENE_EVENT")>: return GetHandlerWithEvent<CStartNetworkSyncedSceneEvent>(instance, client, netGameEvent);
 		case net::force_consteval<uint32_t, HashRageString("NETWORK_UPDATE_SYNCED_SCENE_EVENT")>: return GetHandlerWithEvent<CUpdateNetworkSyncedSceneEvent>(instance, client, netGameEvent);
 		case net::force_consteval<uint32_t, HashRageString("NETWORK_STOP_SYNCED_SCENE_EVENT")>: return GetHandlerWithEvent<CStopNetworkSyncedSceneEvent>(instance, client, netGameEvent);
+		case net::force_consteval<uint32_t, HashRageString("GIVE_PED_SCRIPTED_TASK_EVENT")>: return GetHandlerWithEvent<CGivePedScriptedTaskEvent>(instance, client, netGameEvent);
 		default:
 			break;
 	};

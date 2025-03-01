@@ -1,5 +1,6 @@
-﻿#include "StdInc.h"
+#include "StdInc.h"
 
+#include <filesystem>
 #include <lua.hpp>
 #include <lua_cmsgpacklib.h>
 
@@ -9,15 +10,28 @@
 #include "LuaScriptRuntime.h"
 #include "VFSManager.h"
 
+/* maximum size for an individual 'strftime' item */
+#define SIZETIMEFMT	250
+
 #if !defined(LUA_STRFTIMEOPTIONS)
 
-#if defined(LUA_USE_C89)
-#define LUA_STRFTIMEOPTIONS	{ "aAbBcdHIjmMpSUwWxXyYz%", "" }
+/* options for ANSI C 89 (only 1-char options) */
+#define L_STRFTIMEC89		"aAbBcdHIjmMpSUwWxXyYZ%"
+
+/* options for ISO C 99 and POSIX */
+#define L_STRFTIMEC99 "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%" \
+"||" "EcECExEXEyEY" "OdOeOHOIOmOMOSOuOUOVOwOWOy"  /* two-char options */
+
+/* options for Windows */
+#define L_STRFTIMEWIN "aAbBcdHIjmMpSUwWxXyYzZ%" \
+"||" "#c#x#d#H#I#j#m#M#S#U#w#W#y#Y"  /* two-char options */
+
+#if defined(LUA_USE_WINDOWS)
+#define LUA_STRFTIMEOPTIONS	L_STRFTIMEWIN
+#elif defined(LUA_USE_C89)
+#define LUA_STRFTIMEOPTIONS	L_STRFTIMEC89
 #else  /* C99 specification */
-#define LUA_STRFTIMEOPTIONS \
-	{ "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%", "", \
-	  "E", "cCxXyY",  \
-	  "O", "deHImMSuUVwWy" }
+#define LUA_STRFTIMEOPTIONS	L_STRFTIMEC99
 #endif
 
 #endif
@@ -141,6 +155,55 @@ int LuaOSExecute(lua_State* L)
 	lua_pushstring(L, what);
 	lua_pushinteger(L, stat);
 	return 3; /* return true/nil,what,code */
+}
+
+int LuaOSCreateDir(lua_State* L)
+{
+	const char* directoryPathString = luaL_checkstring(L, 1);
+	std::filesystem::path directoryPath = directoryPathString;
+	// ensure that the path ends with a path separator
+	directoryPath /= "";
+
+	std::string path = directoryPath.generic_string();
+	fwRefContainer<vfs::Device> device = vfs::GetDevice(path);
+	if (!device.GetRef())
+	{
+		std::string directoryAbsolutePath = std::filesystem::absolute(std::filesystem::path(directoryPath)).string();
+		std::string transformedPath;
+		device = vfs::FindDevice(directoryAbsolutePath, transformedPath);
+		if (device.GetRef())
+		{
+			path = transformedPath;
+		}
+	}
+
+	if (!device.GetRef())
+	{
+		return luaL_fileresult(L, 0, directoryPathString);
+	}
+
+	vfs::FindData fd;
+	auto handle = device->FindFirst(path, &fd);
+	if (handle != INVALID_DEVICE_HANDLE)
+	{
+		lua_pushnil(L);
+		lua_pushfstring(L, "%s: %s", directoryPathString, "Directory already exists.");
+		lua_pushinteger(L, 1);
+		return 3;
+	}
+
+	if (!device->CreateDirectory(path))
+	{
+		lua_pushnil(L);
+		lua_pushfstring(L, "%s: %s", directoryPathString, "Failed to create directory");
+		lua_pushinteger(L, 1);
+		device->FindClose(handle);
+		return 3;
+	}
+
+	lua_pushboolean(L, true);
+	device->FindClose(handle);
+	return 1;
 }
 
 int LuaOSRemove(lua_State* L)
@@ -325,37 +388,34 @@ int GetField(lua_State* L, const char* key, int d)
 	return res;
 }
 
-const char* CheckTimeOption(lua_State* L, const char* conv, char* buff)
+const char* CheckTimeOption(lua_State* L, const char* conv, ptrdiff_t convlen, char* buff)
 {
-	static constexpr char* const options[] = LUA_STRFTIMEOPTIONS;
-	for (unsigned int i = 0; i < std::size(options); i += 2)
+	const char* option = LUA_STRFTIMEOPTIONS;
+	int oplen = 1;  /* length of options being checked */
+	for (; *option != '\0' && oplen <= convlen; option += oplen)
 	{
-		if (*conv != '\0' && std::strchr(options[i], *conv) != nullptr)
+		/* next block? */
+		if (*option == '|')
 		{
-			buff[1] = *conv;
-			if (*options[i + 1] == '\0')
-			{
-				/* one-char conversion specifier? */
-				buff[2] = '\0'; /* end buffer */
-				return conv + 1;
-			}
-
-			if (*(conv + 1) != '\0' && std::strchr(options[i + 1], *(conv + 1)) != nullptr)
-			{
-				buff[2] = *(conv + 1); /* valid two-char conversion specifier */
-				buff[3] = '\0'; /* end buffer */
-				return conv + 2;
-			}
+			oplen++;  /* will check options with next length (+1) */
+		}
+		else if (memcmp(conv, option, oplen) == 0)
+		{
+			/* match? */
+			memcpy(buff, conv, oplen);  /* copy valid option to buffer */
+			buff[oplen] = '\0';
+			return conv + oplen;  /* return next item */
 		}
 	}
 
 	luaL_argerror(L, 1, lua_pushfstring(L, "invalid conversion specifier '%%%s'", conv));
-	return conv; /* to avoid warnings */
+	return conv;  /* to avoid warnings */
 }
 
 int LuaOSDate(lua_State* L)
 {
-	const char* s = luaL_optstring(L, 1, "%c");
+	size_t slen;
+	const char *s = luaL_optlstring(L, 1, "%c", &slen);
 	const time_t t = luaL_opt(L, l_checktime, 2, std::time(nullptr));
 	std::tm* stm;
 	if (*s == '!')
@@ -392,27 +452,41 @@ int LuaOSDate(lua_State* L)
 		return 1;
 	}
 
-	char cc[4];
+	char cc[4] {};  /* buffer for individual conversion specifiers */
 	luaL_Buffer b;
 	cc[0] = '%';
 	luaL_buffinit(L, &b);
-	while (*s)
+	const char *se = s + slen;  /* 's' end */
+	while (s < se)
 	{
-		if (*s != '%')
+		/* null terminator ends string */
+		if (*s == '\0')
 		{
-			/* no conversion specifier? */
-			luaL_addchar(&b, *s++);
-			continue;
+			break;
 		}
 
-		char buff[200]; /* should be big enough for any conversion result */
-		s = CheckTimeOption(L, s + 1, cc);
-		size_t resLen = strftime(buff, sizeof(buff), cc, stm);
-		luaL_addlstring(&b, buff, resLen);
+		/* not a conversion specifier? */
+		if (*s != '%')
+		{
+			luaL_addchar(&b, *s++);
+		}
+		else
+		{
+			char *buff = luaL_prepbuffsize(&b, SIZETIMEFMT);
+			s++;  /* skip '%' */
+			if (s == se)
+			{
+				// % last symbol
+				break;
+			}
+
+			s = CheckTimeOption(L, s, se - s, &cc[1]);  /* copy specifier to 'cc' */
+			size_t resLen = strftime(buff, SIZETIMEFMT, cc, stm);
+			luaL_addsize(&b, resLen);
+		}
 	}
 
 	luaL_pushresult(&b);
-
 	return 1;
 }
 
@@ -490,6 +564,7 @@ const luaL_Reg systemLibs[] = {
 	{"difftime", LuaOSDiffTime},
 	{"execute", LuaOSExecute},
 	{"getenv", LuaOSGetEnv},
+	{"createdir", LuaOSCreateDir},
 	{"remove", LuaOSRemove},
 	{"rename", LuaOSRename},
 	{"setlocale", LuaOSSetLocale},
